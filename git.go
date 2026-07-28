@@ -11,9 +11,10 @@ import (
 )
 
 type gitInfo struct {
-	Root     string
-	RepoRoot string
-	Statuses map[string]FileStatus
+	Root         string
+	RepoRoot     string
+	Statuses     map[string]FileStatus
+	TreeStatuses map[string]FileStatus
 }
 
 func runGit(dir string, args ...string) ([]byte, error) {
@@ -74,7 +75,45 @@ func inspectGitWithUntracked(root, mode string) gitInfo {
 		return info
 	}
 	info.Statuses = parseGitStatuses(compareRoot, compareRepo, out)
+	info.TreeStatuses = aggregateGitStatuses(info.Statuses)
 	return info
+}
+
+// aggregateGitStatuses adds a decoration for every directory containing a
+// changed path. Git porcelain reports tracked changes only at their leaf paths,
+// while the explorer deliberately does not load a directory until it is
+// expanded. Keeping this separate from Statuses preserves the exact porcelain
+// paths used for deleted ghosts and directory-scoped refreshes.
+func aggregateGitStatuses(statuses map[string]FileStatus) map[string]FileStatus {
+	treeStatuses := make(map[string]FileStatus, len(statuses))
+	for rel, status := range statuses {
+		rel = filepath.ToSlash(filepath.Clean(rel))
+		if rel == "." || rel == "" || rel == ".." || strings.HasPrefix(rel, "../") {
+			continue
+		}
+		treeStatuses[rel] = mergeFileStatus(treeStatuses[rel], status)
+		for parent := rel; ; {
+			slash := strings.LastIndexByte(parent, '/')
+			if slash < 0 {
+				break
+			}
+			parent = parent[:slash]
+			treeStatuses[parent] = mergeFileStatus(treeStatuses[parent], status)
+		}
+	}
+	return treeStatuses
+}
+
+// A directory with one kind of descendant change uses that change's colour.
+// Mixed additions/deletions/modifications are shown as changed (yellow).
+func mergeFileStatus(current, next FileStatus) FileStatus {
+	if current == StatusNone || current == next {
+		return next
+	}
+	if next == StatusNone {
+		return current
+	}
+	return StatusChanged
 }
 
 // inspectGitDirectory resolves untracked entries only for one opened branch.

@@ -75,6 +75,35 @@ func TestInspectGitTrackedSkipsUntrackedFiles(t *testing.T) {
 	}
 }
 
+func TestInspectGitDecoratesUnopenedAncestors(t *testing.T) {
+	root := t.TempDir()
+	git(t, root, "init", "-q")
+	git(t, root, "config", "user.email", "test@example.com")
+	git(t, root, "config", "user.name", "Test")
+	writeFile(t, filepath.Join(root, "one", "two", "tracked.txt"), "old\n")
+	git(t, root, "add", ".")
+	git(t, root, "commit", "-qm", "initial")
+	writeFile(t, filepath.Join(root, "one", "two", "tracked.txt"), "new\n")
+
+	info := inspectGitTracked(root)
+	if info.TreeStatuses["one"] != StatusChanged {
+		t.Fatalf("top-level directory status = %v, want changed", info.TreeStatuses["one"])
+	}
+	if info.TreeStatuses["one/two"] != StatusChanged {
+		t.Fatalf("nested directory status = %v, want changed", info.TreeStatuses["one/two"])
+	}
+}
+
+func TestAggregateGitStatusesUsesChangedForMixedDescendants(t *testing.T) {
+	statuses := aggregateGitStatuses(map[string]FileStatus{
+		"dir/added.txt":   StatusAdded,
+		"dir/deleted.txt": StatusDeleted,
+	})
+	if statuses["dir"] != StatusChanged {
+		t.Fatalf("mixed directory status = %v, want changed", statuses["dir"])
+	}
+}
+
 func TestGitStatusProbeDoesNotRewriteIndex(t *testing.T) {
 	root := t.TempDir()
 	git(t, root, "init", "-q")

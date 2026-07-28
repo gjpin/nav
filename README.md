@@ -26,4 +26,6 @@ completed mouse selection on the clipboard when the drag is released.
 `r` refreshes and `q` quits.
 
 The explorer marks changed files yellow, added or untracked files green, and
-deleted paths red. Deleted Git paths remain visible as red ghost entries.
+deleted paths red. Directories inherit the status of changes anywhere below
+them, including before they are expanded; mixed kinds of changes are yellow.
+Deleted Git paths remain visible as red ghost entries.

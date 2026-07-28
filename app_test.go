@@ -270,6 +270,21 @@ func TestApplyGitKeepsAddedStatusUntilDirectoryProbeCompletes(t *testing.T) {
 	}
 }
 
+func TestApplyGitDecoratesUnloadedDirectoryFromDescendantStatus(t *testing.T) {
+	root := t.TempDir()
+	tree := &Node{Name: "root", Path: root, Dir: true, Expanded: true}
+	dir := &Node{Name: "dir", Path: filepath.Join(root, "dir"), Rel: "dir", Dir: true, LoadState: LoadUnloaded}
+	tree.add(dir)
+	m := model{root: root, tree: tree}
+
+	m.applyGit(gitInfo{Root: root, Statuses: map[string]FileStatus{
+		"dir/deeper/changed.go": StatusChanged,
+	}})
+	if dir.Status != StatusChanged {
+		t.Fatalf("unloaded directory status = %v, want changed", dir.Status)
+	}
+}
+
 func TestFileWatcherRecognizesGitMetadataEvents(t *testing.T) {
 	gitDir := filepath.Join(t.TempDir(), ".git")
 	fw := &fileWatcher{gitDirs: map[string]bool{gitDir: true}}

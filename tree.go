@@ -188,6 +188,7 @@ func BuildTree(root string, statuses map[string]FileStatus, expanded map[string]
 	root = filepath.Clean(root)
 	tree := &Node{Name: filepath.Base(root), Path: root, Dir: true, Expanded: true, LoadState: LoadLoaded}
 	byRel := map[string]*Node{"": tree}
+	treeStatuses := aggregateGitStatuses(statuses)
 
 	var read func(*Node) error
 	read = func(parent *Node) error {
@@ -205,7 +206,7 @@ func BuildTree(root string, statuses map[string]FileStatus, expanded map[string]
 			// DirEntry.Type is intentionally used here: Info may resolve a link on
 			// some filesystems, while Type keeps directory symlinks as leaf nodes.
 			symlink := entry.Type()&os.ModeSymlink != 0
-			n := &Node{Name: entry.Name(), Path: path, Rel: rel, Dir: entry.IsDir() && !symlink, Symlink: symlink, Status: statuses[rel], Expanded: expanded[rel], LoadState: LoadLoaded}
+			n := &Node{Name: entry.Name(), Path: path, Rel: rel, Dir: entry.IsDir() && !symlink, Symlink: symlink, Status: treeStatuses[rel], Expanded: expanded[rel], LoadState: LoadLoaded}
 			parent.add(n)
 			byRel[rel] = n
 			if n.Dir {

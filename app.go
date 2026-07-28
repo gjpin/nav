@@ -241,7 +241,7 @@ func newModel(root string) (model, error) {
 	f := textinput.New()
 	f.Prompt = "Find: "
 	f.Placeholder = "text"
-	m := model{root: root, tree: tree, git: gitInfo{Root: root, Statuses: make(map[string]FileStatus)}, selected: root, viewport: v, find: f, help: help.New(), keys: newKeyMap(), watcher: newFileWatcher(root), loaders: make(map[string]*directoryLoader), loadGeneration: make(map[string]int), selectionStart: -1, selectionEnd: -1}
+	m := model{root: root, tree: tree, git: gitInfo{Root: root, Statuses: make(map[string]FileStatus), TreeStatuses: make(map[string]FileStatus)}, selected: root, viewport: v, find: f, help: help.New(), keys: newKeyMap(), watcher: newFileWatcher(root), loaders: make(map[string]*directoryLoader), loadGeneration: make(map[string]int), selectionStart: -1, selectionEnd: -1}
 	m.rebuildRows()
 	return m, nil
 }
@@ -329,7 +329,7 @@ func (m *model) loadDirectoryResult(msg directoryMsg) tea.Cmd {
 	if node == nil || !node.Dir {
 		return nil
 	}
-	appendEntries(node, msg.batch.entries, m.git.Statuses)
+	appendEntries(node, msg.batch.entries, m.git.TreeStatuses)
 	if msg.batch.err != nil && !msg.batch.done {
 		node.LoadError = msg.batch.err.Error()
 	}
@@ -383,9 +383,10 @@ func (m *model) applyGit(info gitInfo) {
 	// directory probe until its replacement arrives; otherwise an untracked
 	// directory briefly changes from green to plain on every refresh.
 	clearGitDecorations(m.tree, true)
+	info.TreeStatuses = aggregateGitStatuses(info.Statuses)
 	m.git = info
 	walkNodes(m.tree, func(n *Node) {
-		if status, ok := info.Statuses[n.Rel]; ok {
+		if status, ok := info.TreeStatuses[n.Rel]; ok {
 			n.Status = status
 		}
 	})
@@ -477,10 +478,11 @@ func (m *model) applyDirectoryGit(msg directoryGitMsg) {
 	}
 	for rel, status := range msg.statuses {
 		m.git.Statuses[rel] = status
-		if node := findNode(m.tree, filepath.Join(m.root, filepath.FromSlash(rel))); node != nil {
-			node.Status = status
-		}
 	}
+	m.git.TreeStatuses = aggregateGitStatuses(m.git.Statuses)
+	walkNodes(m.tree, func(n *Node) {
+		n.Status = m.git.TreeStatuses[n.Rel]
+	})
 	m.rebuildRows()
 }
 
