@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -26,7 +27,7 @@ var (
 )
 
 type keyMap struct {
-	Up, Down, Toggle, Open, Preview, Diff, Find, Next, Previous, Refresh, Quit, Copy key.Binding
+	Up, Down, Toggle, Open, Preview, Diff, Find, Next, Refresh, Quit, Copy key.Binding
 }
 
 func newKeyMap() keyMap {
@@ -34,9 +35,9 @@ func newKeyMap() keyMap {
 		Up: key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "move")), Down: key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "move")),
 		Toggle: key.NewBinding(key.WithKeys("left", "right"), key.WithHelp("←/→", "collapse/expand")), Open: key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open")),
 		Preview: key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "preview")), Diff: key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "diff")),
-		Find: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "find")), Next: key.NewBinding(key.WithKeys("n"), key.WithHelp("n/N", "match")),
-		Previous: key.NewBinding(key.WithKeys("N"), key.WithHelp("N", "previous match")), Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-		Quit: key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")), Copy: key.NewBinding(key.WithKeys("y", "ctrl+c"), key.WithHelp("y", "copy selection")),
+		Find: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "find")), Next: key.NewBinding(key.WithKeys("n", "N"), key.WithHelp("n/N", "next match")),
+		Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		Quit:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")), Copy: key.NewBinding(key.WithKeys("y", "ctrl+c"), key.WithHelp("y", "copy selection")),
 	}
 }
 
@@ -44,7 +45,7 @@ func (k keyMap) ShortHelp() []key.Binding {
 	return []key.Binding{k.Up, k.Open, k.Preview, k.Diff, k.Find, k.Refresh, k.Quit}
 }
 func (k keyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{k.ShortHelp(), {k.Copy, k.Next, k.Previous}}
+	return [][]key.Binding{k.ShortHelp(), {k.Copy, k.Next}}
 }
 
 type directoryMsg struct {
@@ -169,8 +170,11 @@ type model struct {
 	width, height, treeHeight        int
 	focusPreview, diffMode, finding  bool
 	preview                          string
+	previewPath                      string
 	renderedPreview                  string
 	previewLines                     []string
+	findMatches                      [][]int
+	findIndex                        int
 	added                            map[int]bool
 	changed                          map[int]bool
 	removed                          map[int]int
@@ -450,6 +454,7 @@ func (m *model) requestPreview(openToChange bool) tea.Cmd {
 		return nil
 	}
 	m.previewGeneration++
+	m.previewPath = n.Path
 	m.preview = "Loading preview…"
 	m.renderedPreview = m.preview
 	m.previewLines = []string{m.preview}
@@ -518,22 +523,65 @@ func (m *model) applyPreview(msg previewMsg, openToChange bool) {
 }
 
 func (m *model) applyFind() {
+	// viewport's built-in highlighter cannot track byte offsets through ANSI
+	// sequences. Apply a background-only ANSI overlay instead, preserving the
+	// syntax formatter's foreground colours and attributes.
 	m.viewport.ClearHighlights()
 	needle := m.find.Value()
 	if needle == "" {
+		m.findMatches, m.findIndex = nil, 0
+		m.viewport.SetContent(m.renderedPreview)
 		return
 	}
-	var ranges [][]int
-	for start := 0; ; {
-		i := strings.Index(m.preview[start:], needle)
-		if i < 0 {
-			break
-		}
-		a := start + i
-		ranges = append(ranges, rawRangeToRendered(m.preview, m.renderedPreview, a, a+len(needle)))
-		start = a + len(needle)
+	m.findMatches = findRanges(m.preview, needle)
+	m.findIndex = 0
+	m.renderFindHighlights()
+}
+
+// findRanges treats user input as literal text, not a regular expression, and
+// uses Go's Unicode-aware case-insensitive matching for byte ranges accepted
+// by the viewport.
+func findRanges(source, needle string) [][]int {
+	pattern, err := regexp.Compile("(?i)" + regexp.QuoteMeta(needle))
+	if err != nil {
+		return nil
 	}
-	m.viewport.SetHighlights(ranges)
+	return pattern.FindAllStringIndex(source, -1)
+}
+
+const (
+	findBackground         = "\x1b[48;5;237m"
+	selectedFindBackground = "\x1b[48;5;62m"
+	clearFindBackground    = "\x1b[49m"
+)
+
+func (m *model) renderFindHighlights() {
+	rendered := m.renderedPreview
+	for i := len(m.findMatches) - 1; i >= 0; i-- {
+		r := rawRangeToRendered(m.preview, m.renderedPreview, m.findMatches[i][0], m.findMatches[i][1])
+		if r[0] < 0 || r[1] < r[0] || r[1] > len(rendered) {
+			continue
+		}
+		background := findBackground
+		if i == m.findIndex {
+			background = selectedFindBackground
+		}
+		// Chroma resets styles between tokens. Reapply the background after a
+		// reset when a text match spans token boundaries.
+		middle := strings.ReplaceAll(rendered[r[0]:r[1]], "\x1b[0m", "\x1b[0m"+background)
+		rendered = rendered[:r[0]] + background + middle + clearFindBackground + rendered[r[1]:]
+	}
+	m.viewport.SetContent(rendered)
+}
+
+func (m *model) nextFind(delta int) {
+	if len(m.findMatches) == 0 {
+		return
+	}
+	m.findIndex = (m.findIndex + delta + len(m.findMatches)) % len(m.findMatches)
+	m.renderFindHighlights()
+	line := strings.Count(m.preview[:m.findMatches[m.findIndex][0]], "\n")
+	m.viewport.SetYOffset(line)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -646,8 +694,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if k == "/" {
+			// A new search starts from a clean query. Keep the prior query only
+			// while its input remains open, so reopening find after Enter/Esc
+			// never carries stale highlights into the next search.
+			m.find.Reset()
+			m.findMatches, m.findIndex = nil, 0
+			m.viewport.ClearHighlights()
+			m.viewport.SetContent(m.renderedPreview)
 			m.finding = true
-			return m, m.find.Focus()
+			m.focusPreview = true
+			focus := m.find.Focus()
+			if n := m.selectedNode(); n != nil && !n.Dir && m.previewPath != n.Path {
+				// Startup avoids preview I/O. A search is an explicit request for
+				// the selected file's content, so load it before matching.
+				return m, tea.Batch(focus, m.requestPreview(false))
+			}
+			m.applyFind()
+			return m, focus
 		}
 		if k == "r" {
 			cmds = append(cmds, m.startDirectoryLoad(m.tree))
@@ -665,11 +728,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.focusPreview {
 			if k == "n" {
-				m.viewport.HighlightNext()
+				m.nextFind(1)
 				return m, nil
 			}
 			if k == "N" {
-				m.viewport.HighlightPrevious()
+				m.nextFind(1)
 				return m, nil
 			}
 			if k == "y" || k == "ctrl+c" {
