@@ -46,6 +46,7 @@ type Node struct {
 	LoadError string
 	Parent    *Node
 	Children  []*Node
+	seen      bool // set while a directory refresh is in progress
 }
 
 const directoryBatchSize = 256
@@ -123,6 +124,7 @@ func appendEntries(root *Node, entries []os.DirEntry, statuses map[string]FileSt
 			if existing.Path != path {
 				continue
 			}
+			existing.seen = true
 			existing.Name, existing.Rel = entry.Name(), rel
 			existing.Dir, existing.Symlink, existing.Ghost = entry.IsDir() && !symlink, symlink, false
 			if status, ok := statuses[rel]; ok {
@@ -130,7 +132,7 @@ func appendEntries(root *Node, entries []os.DirEntry, statuses map[string]FileSt
 			}
 			goto next
 		}
-		root.add(&Node{Name: entry.Name(), Path: path, Rel: rel, Dir: entry.IsDir() && !symlink, Symlink: symlink, Status: statuses[rel], LoadState: LoadUnloaded})
+		root.add(&Node{Name: entry.Name(), Path: path, Rel: rel, Dir: entry.IsDir() && !symlink, Symlink: symlink, Status: statuses[rel], LoadState: LoadUnloaded, seen: true})
 	next:
 	}
 }

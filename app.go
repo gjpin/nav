@@ -82,6 +82,7 @@ type fileWatcher struct {
 	once    sync.Once
 	mu      sync.Mutex
 	watched map[string]bool
+	gitDirs map[string]bool
 }
 
 func newFileWatcher(root string) *fileWatcher {
@@ -89,7 +90,7 @@ func newFileWatcher(root string) *fileWatcher {
 	if err != nil {
 		return nil
 	}
-	fw := &fileWatcher{w: w, changes: make(chan string, 1), done: make(chan struct{}), watched: make(map[string]bool)}
+	fw := &fileWatcher{w: w, changes: make(chan string, 1), done: make(chan struct{}), watched: make(map[string]bool), gitDirs: make(map[string]bool)}
 	fw.watch(root)
 	go fw.loop()
 	return fw
@@ -106,6 +107,32 @@ func (f *fileWatcher) watch(root string) {
 	f.watched[root] = true
 }
 
+func (f *fileWatcher) watchGit(root string) {
+	dir := gitMetadataDir(root)
+	if dir == "" {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.watched[dir] && f.w.Add(dir) == nil {
+		f.watched[dir] = true
+	}
+	if f.watched[dir] {
+		f.gitDirs[dir] = true
+	}
+}
+
+func (f *fileWatcher) isGitPath(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for dir := range f.gitDirs {
+		if path == dir || strings.HasPrefix(path, dir+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (f *fileWatcher) unwatchBelow(root string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -113,6 +140,7 @@ func (f *fileWatcher) unwatchBelow(root string) {
 		if path != root && strings.HasPrefix(path, root+string(filepath.Separator)) {
 			_ = f.w.Remove(path)
 			delete(f.watched, path)
+			delete(f.gitDirs, path)
 		}
 	}
 }
@@ -238,13 +266,12 @@ func (m *model) startDirectoryLoad(node *Node) tea.Cmd {
 	}
 	m.loadGeneration[node.Path]++
 	generation := m.loadGeneration[node.Path]
-	kept := node.Children[:0]
 	for _, child := range node.Children {
-		if hasGhost(child) {
-			kept = append(kept, child)
-		}
+		// Keep the last completed view on screen while the replacement scan is
+		// running. Clearing it here made newly created directories briefly
+		// disappear after each filesystem event.
+		child.seen = false
 	}
-	node.Children = kept
 	node.LoadError = ""
 	node.LoadState = LoadLoading
 	loader := newDirectoryLoader(node.Path)
@@ -301,6 +328,16 @@ func (m *model) loadDirectoryResult(msg directoryMsg) tea.Cmd {
 		if msg.batch.err != nil && msg.batch.err.Error() != "EOF" {
 			node.LoadState, node.LoadError = LoadFailed, msg.batch.err.Error()
 		} else {
+			// Drop paths that were absent from the completed scan, but retain
+			// deleted Git ghosts (including their ancestors) until Git says they
+			// are no longer deleted.
+			children := node.Children[:0]
+			for _, child := range node.Children {
+				if child.seen || hasGhost(child) {
+					children = append(children, child)
+				}
+			}
+			node.Children = children
 			node.LoadState = LoadLoaded
 			node.sort()
 		}
@@ -331,14 +368,47 @@ func (m *model) loadDirectoryResult(msg directoryMsg) tea.Cmd {
 }
 
 func (m *model) applyGit(info gitInfo) {
+	// The initial Git probe deliberately skips untracked files so opening a
+	// large repository stays cheap. Keep any added badges from the preceding
+	// directory probe until its replacement arrives; otherwise an untracked
+	// directory briefly changes from green to plain on every refresh.
+	clearGitDecorations(m.tree, true)
 	m.git = info
-	for _, n := range visibleNodes(m.tree) {
+	walkNodes(m.tree, func(n *Node) {
 		if status, ok := info.Statuses[n.Rel]; ok {
 			n.Status = status
 		}
-	}
+	})
 	m.addDeletedGhosts()
 	m.rebuildRows()
+}
+
+func clearGitDecorations(n *Node, keepAdded bool) {
+	if n == nil {
+		return
+	}
+	if !keepAdded || n.Status != StatusAdded {
+		n.Status = StatusNone
+	}
+	children := n.Children[:0]
+	for _, child := range n.Children {
+		if child.Ghost {
+			continue
+		}
+		clearGitDecorations(child, keepAdded)
+		children = append(children, child)
+	}
+	n.Children = children
+}
+
+func walkNodes(n *Node, visit func(*Node)) {
+	if n == nil {
+		return
+	}
+	visit(n)
+	for _, child := range n.Children {
+		walkNodes(child, visit)
+	}
 }
 
 func (m *model) addDeletedGhosts() {
@@ -377,6 +447,23 @@ func directoryGitCmd(info gitInfo, node *Node, generation int) tea.Cmd {
 func (m *model) applyDirectoryGit(msg directoryGitMsg) {
 	if msg.generation != m.loadGeneration[msg.path] {
 		return
+	}
+	node := findNode(m.tree, msg.path)
+	if node == nil {
+		return
+	}
+	// This probe is authoritative for the directory's direct entries. Clear a
+	// prior untracked badge only after the replacement probe has completed, so
+	// a tracked-only refresh cannot make it flicker in the meantime.
+	if msg.statuses != nil {
+		for _, child := range node.Children {
+			if child.Status == StatusAdded {
+				if _, ok := msg.statuses[child.Rel]; !ok {
+					child.Status = StatusNone
+					delete(m.git.Statuses, child.Rel)
+				}
+			}
+		}
 	}
 	for rel, status := range msg.statuses {
 		m.git.Statuses[rel] = status
@@ -599,6 +686,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case gitMsg:
 		if msg.generation == m.gitGeneration {
 			m.applyGit(msg.info)
+			if m.watcher != nil && msg.info.RepoRoot != "" {
+				m.watcher.watchGit(m.root)
+			}
 			if m.tree.LoadState == LoadLoaded {
 				return m, directoryGitCmd(m.git, m.tree, m.loadGeneration[m.tree.Path])
 			}
@@ -611,6 +701,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyPreview(msg, msg.openToChange)
 		return m, nil
 	case watchMsg:
+		if m.watcher != nil && m.watcher.isGitPath(msg.path) {
+			m.gitGeneration++
+			cmds = append(cmds, gitCmd(m.root, m.gitGeneration), m.watcher.next())
+			return m, tea.Batch(cmds...)
+		}
 		node := findNode(m.tree, filepath.Dir(msg.path))
 		if node == nil || !node.Dir {
 			node = m.tree

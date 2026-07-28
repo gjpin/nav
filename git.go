@@ -18,11 +18,33 @@ type gitInfo struct {
 
 func runGit(dir string, args ...string) ([]byte, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	// git status normally refreshes the index and can rewrite it. Navigator
+	// watches Git metadata for changes, so that write would be observed as a
+	// new change and cause an endless refresh cycle. These are read-only
+	// queries; disable Git's optional locks (and the accompanying index write).
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	return cmd.Output()
 }
 
 func inspectGit(root string) gitInfo {
 	return inspectGitWithUntracked(root, "all")
+}
+
+// gitMetadataDir returns the directory whose changes alter Git status (index,
+// HEAD, and refs). It also resolves linked worktrees, where .git is a file.
+func gitMetadataDir(root string) string {
+	out, err := runGit(root, "rev-parse", "--git-dir")
+	if err != nil {
+		return ""
+	}
+	dir := strings.TrimSpace(string(out))
+	if dir == "" {
+		return ""
+	}
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(root, dir)
+	}
+	return filepath.Clean(dir)
 }
 
 // inspectGitTracked avoids walking untracked directories. It is safe to run

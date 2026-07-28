@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func git(t *testing.T, dir string, args ...string) {
@@ -74,6 +75,37 @@ func TestInspectGitTrackedSkipsUntrackedFiles(t *testing.T) {
 	}
 }
 
+func TestGitStatusProbeDoesNotRewriteIndex(t *testing.T) {
+	root := t.TempDir()
+	git(t, root, "init", "-q")
+	git(t, root, "config", "user.email", "test@example.com")
+	git(t, root, "config", "user.name", "Test")
+	writeFile(t, filepath.Join(root, "tracked.txt"), "old\n")
+	git(t, root, "add", ".")
+	git(t, root, "commit", "-qm", "initial")
+	writeFile(t, filepath.Join(root, "tracked.txt"), "new\n")
+
+	index := filepath.Join(root, ".git", "index")
+	want := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(index, want, want); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info := inspectGitTracked(root); info.Statuses["tracked.txt"] != StatusChanged {
+		t.Fatalf("tracked status = %v, want changed", info.Statuses["tracked.txt"])
+	}
+	after, err := os.Stat(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("status probe rewrote index: before=%v after=%v", before.ModTime(), after.ModTime())
+	}
+}
+
 func TestInspectGitDirectoryFindsUntrackedDirectoryWithoutFullStatus(t *testing.T) {
 	root := t.TempDir()
 	git(t, root, "init", "-q")
@@ -82,6 +114,14 @@ func TestInspectGitDirectoryFindsUntrackedDirectoryWithoutFullStatus(t *testing.
 	statuses := inspectGitDirectory(info, "")
 	if statuses["untracked"] != StatusAdded {
 		t.Fatalf("untracked directory status = %v, statuses=%v", statuses["untracked"], statuses)
+	}
+}
+
+func TestGitMetadataDir(t *testing.T) {
+	root := t.TempDir()
+	git(t, root, "init", "-q")
+	if got, want := gitMetadataDir(root), filepath.Join(root, ".git"); got != want {
+		t.Fatalf("git metadata dir = %q, want %q", got, want)
 	}
 }
 

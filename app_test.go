@@ -142,3 +142,71 @@ func TestUppercaseNAdvancesToTheNextMatch(t *testing.T) {
 		t.Fatalf("N navigated to index=%d, y=%d; want second match", m.findIndex, m.viewport.YOffset())
 	}
 }
+
+func TestApplyGitClearsStaleStatusesAndGhosts(t *testing.T) {
+	root := t.TempDir()
+	tree := &Node{Name: "root", Path: root, Dir: true, Expanded: true}
+	changed := &Node{Name: "changed.go", Path: filepath.Join(root, "changed.go"), Rel: "changed.go", Status: StatusChanged}
+	ghost := &Node{Name: "deleted.go", Path: filepath.Join(root, "deleted.go"), Rel: "deleted.go", Ghost: true, Status: StatusDeleted}
+	tree.add(changed)
+	tree.add(ghost)
+	m := model{root: root, tree: tree}
+	m.applyGit(gitInfo{Root: root, Statuses: map[string]FileStatus{}})
+	if changed.Status != StatusNone {
+		t.Fatalf("stale status = %v, want none", changed.Status)
+	}
+	if findNode(tree, ghost.Path) != nil {
+		t.Fatal("stale deleted ghost was retained")
+	}
+}
+
+func TestApplyGitKeepsAddedStatusUntilDirectoryProbeCompletes(t *testing.T) {
+	root := t.TempDir()
+	tree := &Node{Name: "root", Path: root, Dir: true, Expanded: true}
+	added := &Node{Name: ".github", Path: filepath.Join(root, ".github"), Rel: ".github", Dir: true, Status: StatusAdded}
+	tree.add(added)
+	m := model{root: root, tree: tree}
+
+	m.applyGit(gitInfo{Root: root, Statuses: map[string]FileStatus{}})
+	if added.Status != StatusAdded {
+		t.Fatalf("added status = %v, want it preserved until the directory probe", added.Status)
+	}
+}
+
+func TestFileWatcherRecognizesGitMetadataEvents(t *testing.T) {
+	gitDir := filepath.Join(t.TempDir(), ".git")
+	fw := &fileWatcher{gitDirs: map[string]bool{gitDir: true}}
+	if !fw.isGitPath(filepath.Join(gitDir, "index")) {
+		t.Fatal("Git index event was not recognized")
+	}
+	if fw.isGitPath(filepath.Join(filepath.Dir(gitDir), "file.go")) {
+		t.Fatal("working-tree event was treated as Git metadata")
+	}
+}
+
+func TestDirectoryRefreshKeepsExistingEntriesVisibleUntilScanCompletes(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, ".github", "workflows", "test.yml"), "name: test\n")
+
+	tree := &Node{Name: "root", Path: root, Dir: true, Expanded: true, LoadState: LoadLoaded}
+	github := &Node{Name: ".github", Path: filepath.Join(root, ".github"), Rel: ".github", Dir: true}
+	stale := &Node{Name: "stale", Path: filepath.Join(root, "stale"), Rel: "stale"}
+	tree.add(github)
+	tree.add(stale)
+	m := model{root: root, tree: tree, loaders: make(map[string]*directoryLoader), loadGeneration: make(map[string]int)}
+
+	cmd := m.startDirectoryLoad(tree)
+	if findNode(tree, github.Path) == nil {
+		t.Fatal("existing directory disappeared while its refresh was pending")
+	}
+	msg := cmd().(directoryMsg)
+	if next := m.loadDirectoryResult(msg); next != nil {
+		t.Fatal("small directory unexpectedly needed another batch")
+	}
+	if findNode(tree, github.Path) == nil {
+		t.Fatal("refreshed directory was removed")
+	}
+	if findNode(tree, stale.Path) != nil {
+		t.Fatal("path absent from completed scan was retained")
+	}
+}
