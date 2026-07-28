@@ -19,7 +19,11 @@ go run . [directory]
 Use the arrow keys (or `j`/`k`) to move in the explorer, `Enter` to expand or
 open, and `Tab` to focus the preview. `d` switches between a full-file preview
 and a unified diff. `/` searches the current preview; `n`/`N` navigate matches.
-`r` refreshes, `y` copies a selected preview range, and `q` quits.
+Click and drag in the preview to select text; `y` copies the exact selection.
+The standard copy shortcut also works: `Cmd+C` on macOS and `Ctrl+C` on Linux.
+Because many macOS terminals intercept `Cmd+C`, Navigator also places a
+completed mouse selection on the clipboard when the drag is released.
+`r` refreshes and `q` quits.
 
 The explorer marks changed files yellow, added or untracked files green, and
 deleted paths red. Deleted Git paths remain visible as red ghost entries.

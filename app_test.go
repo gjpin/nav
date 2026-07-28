@@ -143,6 +143,103 @@ func TestUppercaseNAdvancesToTheNextMatch(t *testing.T) {
 	}
 }
 
+func TestOrderedSelectionRangeSupportsCharacterOffsetsAndReverseDrags(t *testing.T) {
+	source := "first\nsecond\nthird"
+	start, end, ok := orderedSelectionRange(source, 10, 8)
+	if !ok {
+		t.Fatal("selection range was not created")
+	}
+	if got := source[start:end]; got != "co" {
+		t.Fatalf("selected source = %q, want %q", got, "co")
+	}
+	if _, _, ok := orderedSelectionRange(source, -1, 0); ok {
+		t.Fatal("negative selection start produced a range")
+	}
+}
+
+func TestByteOffsetsAtDisplayCellHandlesWideCharactersCombiningMarksAndTabs(t *testing.T) {
+	line := "a界e\u0301\tz"
+	tests := []struct {
+		cell        int
+		before, end int
+	}{
+		{cell: 0, before: 0, end: 1},
+		{cell: 1, before: 1, end: 4},
+		{cell: 2, before: 1, end: 4},
+		{cell: 3, before: 4, end: 7},
+		{cell: 4, before: 7, end: 8},
+		{cell: 7, before: 7, end: 8},
+		{cell: 8, before: 8, end: 9},
+	}
+	for _, test := range tests {
+		before, end := byteOffsetsAtDisplayCell(line, test.cell)
+		if before != test.before || end != test.end {
+			t.Errorf("cell %d = (%d, %d), want (%d, %d)", test.cell, before, end, test.before, test.end)
+		}
+	}
+}
+
+func TestPreviewOffsetsAccountForTabStopsAfterLineNumberGutter(t *testing.T) {
+	line := "\talpha"
+	before, end := byteOffsetsAtDisplayCellFromColumn(line, 1, previewGutterWidth)
+	if before != 1 || end != 2 {
+		t.Fatalf("cell after gutter-aligned tab = (%d, %d), want first letter (1, 2)", before, end)
+	}
+}
+
+func TestSelectedTextReturnsOnlyDraggedCharacters(t *testing.T) {
+	source := "alpha\nbravo\ncharlie"
+	m := model{preview: source, selectionStart: 3, selectionEnd: 11}
+	if got := m.selectedText(); got != "ha\nbravo" {
+		t.Fatalf("selected text = %q, want %q", got, "ha\\nbravo")
+	}
+}
+
+func TestSystemCopyShortcutsCopyAnActiveSelection(t *testing.T) {
+	for _, mod := range []tea.KeyMod{tea.ModCtrl, tea.ModSuper} {
+		m := model{preview: "selected", selectionStart: 0, selectionEnd: len("selected"), focusPreview: true}
+		_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: mod})
+		if cmd == nil {
+			t.Fatalf("modifier %v did not produce a clipboard command", mod)
+		}
+		if _, quitting := cmd().(tea.QuitMsg); quitting {
+			t.Fatalf("modifier %v quit instead of copying", mod)
+		}
+	}
+}
+
+func TestControlCWithoutASelectionStillQuits(t *testing.T) {
+	m := model{selectionStart: -1, selectionEnd: -1}
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd == nil {
+		t.Fatal("ctrl+c without a selection did not produce a command")
+	}
+	if _, quitting := cmd().(tea.QuitMsg); !quitting {
+		t.Fatal("ctrl+c without a selection did not quit")
+	}
+}
+
+func TestSelectionHighlightPreservesSyntaxHighlightedSource(t *testing.T) {
+	source := "package main\nfunc main() {}\n"
+	rendered := renderPreview("main.go", source)
+	decorated := highlightRawRange(rendered, source, len("package main\n"), len(source)-1, selectionBackground)
+	if got := stripANSI(decorated); got != source {
+		t.Fatalf("stripped selection = %q, want %q", got, source)
+	}
+	if !strings.Contains(decorated, selectionBackground) {
+		t.Fatal("selection background was not rendered")
+	}
+}
+
+func TestSelectionHighlightClearsBackgroundAcrossLineNumberGutters(t *testing.T) {
+	source := "alpha\nbravo"
+	decorated := highlightRawRange(source, source, 0, len(source), selectionBackground)
+	boundary := clearFindBackground + "\n" + selectionBackground
+	if !strings.Contains(decorated, boundary) {
+		t.Fatalf("selection did not clear and restore its background at newline: %q", decorated)
+	}
+}
+
 func TestApplyGitClearsStaleStatusesAndGhosts(t *testing.T) {
 	root := t.TempDir()
 	tree := &Node{Name: "root", Path: root, Dir: true, Expanded: true}

@@ -80,7 +80,19 @@ func (l *directoryLoader) read() {
 	}
 	defer f.Close()
 	for {
-		entries, err := f.ReadDir(directoryBatchSize)
+		entries := make([]os.DirEntry, 0, directoryBatchSize)
+		var err error
+		// ReadDir may return fewer than the requested number of entries with a
+		// nil error, reporting EOF only on a later call. Fill each batch (or
+		// reach EOF) so small directories complete in a single UI update.
+		for len(entries) < directoryBatchSize && err == nil {
+			more, nextErr := f.ReadDir(directoryBatchSize - len(entries))
+			entries = append(entries, more...)
+			err = nextErr
+			if len(more) == 0 && err == nil {
+				err = io.EOF
+			}
+		}
 		batch := directoryBatch{entries: entries, done: err == io.EOF, err: err}
 		if err != nil && err != io.EOF {
 			batch.done = true

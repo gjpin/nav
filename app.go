@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
@@ -15,6 +17,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/fsnotify/fsnotify"
+	"github.com/mattn/go-runewidth"
 )
 
 var (
@@ -26,18 +29,24 @@ var (
 	cyanStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
 )
 
+const previewGutterWidth = 7
+
 type keyMap struct {
 	Up, Down, Toggle, Open, Preview, Diff, Find, Next, Refresh, Quit, Copy key.Binding
 }
 
 func newKeyMap() keyMap {
+	copyHelp := "ctrl+c"
+	if runtime.GOOS == "darwin" {
+		copyHelp = "⌘c"
+	}
 	return keyMap{
 		Up: key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "move")), Down: key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "move")),
 		Toggle: key.NewBinding(key.WithKeys("left", "right"), key.WithHelp("←/→", "collapse/expand")), Open: key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open")),
 		Preview: key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "preview")), Diff: key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "diff")),
 		Find: key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "find")), Next: key.NewBinding(key.WithKeys("n", "N"), key.WithHelp("n/N", "next match")),
 		Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-		Quit:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")), Copy: key.NewBinding(key.WithKeys("y", "ctrl+c"), key.WithHelp("y", "copy selection")),
+		Quit:    key.NewBinding(key.WithKeys("q"), key.WithHelp("q", "quit")), Copy: key.NewBinding(key.WithKeys("y", "ctrl+c", "super+c"), key.WithHelp(copyHelp, "copy selection")),
 	}
 }
 
@@ -201,13 +210,14 @@ type model struct {
 	previewPath                      string
 	renderedPreview                  string
 	previewLines                     []string
+	previewLineOffsets               []int
 	findMatches                      [][]int
 	findIndex                        int
 	added                            map[int]bool
 	changed                          map[int]bool
 	removed                          map[int]int
 	selectionStart, selectionEnd     int
-	selecting                        bool
+	selecting, selectionMoved        bool
 	viewport                         viewport.Model
 	find                             textinput.Model
 	help                             help.Model
@@ -540,11 +550,12 @@ func (m *model) requestPreview(openToChange bool) tea.Cmd {
 	if n == nil || n.Dir {
 		return nil
 	}
+	m.clearSelection()
 	m.previewGeneration++
 	m.previewPath = n.Path
 	m.preview = "Loading preview…"
 	m.renderedPreview = m.preview
-	m.previewLines = []string{m.preview}
+	m.previewLines, m.previewLineOffsets = splitPreviewLines(m.preview)
 	m.viewport.SetContent(m.preview)
 	return previewCmd(m.git, *n, m.diffMode, openToChange, m.previewGeneration)
 }
@@ -555,7 +566,8 @@ func (m *model) applyPreview(msg previewMsg, openToChange bool) {
 		return
 	}
 	m.preview = msg.text
-	m.previewLines = strings.Split(msg.text, "\n")
+	m.clearSelection()
+	m.previewLines, m.previewLineOffsets = splitPreviewLines(msg.text)
 	m.added, m.changed, m.removed = msg.added, msg.changed, msg.removed
 	m.renderedPreview = msg.rendered
 	m.viewport.SetContent(m.renderedPreview)
@@ -584,7 +596,7 @@ func (m *model) applyPreview(msg previewMsg, openToChange bool) {
 	}
 	m.viewport.LeftGutterFunc = func(c viewport.GutterContext) string {
 		if c.Soft {
-			return "       "
+			return strings.Repeat(" ", previewGutterWidth)
 		}
 		if c.Index >= len(m.previewLines) {
 			return mutedStyle.Render("     ~ ")
@@ -617,12 +629,12 @@ func (m *model) applyFind() {
 	needle := m.find.Value()
 	if needle == "" {
 		m.findMatches, m.findIndex = nil, 0
-		m.viewport.SetContent(m.renderedPreview)
+		m.renderPreviewHighlights()
 		return
 	}
 	m.findMatches = findRanges(m.preview, needle)
 	m.findIndex = 0
-	m.renderFindHighlights()
+	m.renderPreviewHighlights()
 }
 
 // findRanges treats user input as literal text, not a regular expression, and
@@ -639,26 +651,79 @@ func findRanges(source, needle string) [][]int {
 const (
 	findBackground         = "\x1b[48;5;237m"
 	selectedFindBackground = "\x1b[48;5;62m"
+	selectionBackground    = "\x1b[48;5;60m"
 	clearFindBackground    = "\x1b[49m"
 )
 
-func (m *model) renderFindHighlights() {
+// renderPreviewHighlights layers find and selection backgrounds over the
+// syntax-highlighted preview. Both use raw source offsets, so each layer maps
+// through any ANSI sequences inserted by the layers before it.
+func (m *model) renderPreviewHighlights() {
 	rendered := m.renderedPreview
 	for i := len(m.findMatches) - 1; i >= 0; i-- {
-		r := rawRangeToRendered(m.preview, m.renderedPreview, m.findMatches[i][0], m.findMatches[i][1])
-		if r[0] < 0 || r[1] < r[0] || r[1] > len(rendered) {
-			continue
-		}
 		background := findBackground
 		if i == m.findIndex {
 			background = selectedFindBackground
 		}
-		// Chroma resets styles between tokens. Reapply the background after a
-		// reset when a text match spans token boundaries.
-		middle := strings.ReplaceAll(rendered[r[0]:r[1]], "\x1b[0m", "\x1b[0m"+background)
-		rendered = rendered[:r[0]] + background + middle + clearFindBackground + rendered[r[1]:]
+		rendered = highlightRawRange(rendered, m.preview, m.findMatches[i][0], m.findMatches[i][1], background)
+	}
+	if start, end, ok := orderedSelectionRange(m.preview, m.selectionStart, m.selectionEnd); ok {
+		rendered = highlightRawRange(rendered, m.preview, start, end, selectionBackground)
 	}
 	m.viewport.SetContent(rendered)
+}
+
+// renderFindHighlights remains the narrow entry point used by find navigation.
+// Selection decorations are included as well so a visible selection survives
+// opening, editing, and navigating a find query.
+func (m *model) renderFindHighlights() { m.renderPreviewHighlights() }
+
+// highlightRawRange adds a background to a raw-source range without losing
+// any syntax colours already in rendered.
+func highlightRawRange(rendered, raw string, start, end int, background string) string {
+	r := rawRangeToRendered(raw, rendered, start, end)
+	if r[0] < 0 || r[1] <= r[0] || r[1] > len(rendered) {
+		return rendered
+	}
+	// Chroma resets styles between tokens. Reapply the background after a reset
+	// when a highlighted range spans token boundaries.
+	middle := strings.ReplaceAll(rendered[r[0]:r[1]], "\x1b[0m", "\x1b[0m"+background)
+	// A terminal background remains active across newlines. Clear it before
+	// each newline and restore it at the beginning of the next content line;
+	// the viewport inserts its line-number gutter before that content.
+	middle = strings.ReplaceAll(middle, "\n", clearFindBackground+"\n"+background)
+	return rendered[:r[0]] + background + middle + clearFindBackground + rendered[r[1]:]
+}
+
+func orderedSelectionRange(source string, start, end int) (int, int, bool) {
+	if start < 0 || end < 0 || source == "" {
+		return 0, 0, false
+	}
+	if start > end {
+		start, end = end, start
+	}
+	start = min(start, len(source))
+	end = min(end, len(source))
+	if start >= end {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+func (m *model) clearSelection() {
+	m.selectionStart, m.selectionEnd = -1, -1
+	m.selecting, m.selectionMoved = false, false
+}
+
+func splitPreviewLines(source string) ([]string, []int) {
+	lines := strings.Split(source, "\n")
+	offsets := make([]int, len(lines))
+	offset := 0
+	for i, line := range lines {
+		offsets[i] = offset
+		offset += len(line) + 1
+	}
+	return lines, offsets
 }
 
 func (m *model) nextFind(delta int) {
@@ -755,17 +820,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(cmds...)
 		}
-		if mouse.Y > m.treeHeight && mouse.Button == tea.MouseLeft && m.focusPreview {
-			m.selectionStart, m.selectionEnd, m.selecting = m.viewport.YOffset()+mouse.Y-m.treeHeight-1, m.viewport.YOffset()+mouse.Y-m.treeHeight-1, true
+		if offset, ok := m.previewOffsetAt(mouse.X, mouse.Y); ok && mouse.Button == tea.MouseLeft {
+			// A preview click should both focus the pane and begin selection. Requiring
+			// Tab first made mouse selection appear completely unresponsive.
+			m.focusPreview = true
+			m.selectionStart, m.selectionEnd, m.selecting = offset, offset, true
+			m.selectionMoved = false
+			m.renderPreviewHighlights()
 			return m, nil
 		}
 	case tea.MouseMotionMsg:
-		if m.selecting && m.focusPreview {
-			m.selectionEnd = m.viewport.YOffset() + msg.Mouse().Y - m.treeHeight - 1
+		if m.selecting {
+			mouse := msg.Mouse()
+			m.selectionMoved = true
+			m.selectionEnd = m.previewOffsetAtOrEdge(mouse.X, mouse.Y, true)
+			m.renderPreviewHighlights()
 			return m, nil
 		}
 	case tea.MouseReleaseMsg:
-		m.selecting = false
+		if m.selecting {
+			mouse := msg.Mouse()
+			if m.selectionMoved {
+				m.selectionEnd = m.previewOffsetAtOrEdge(mouse.X, mouse.Y, true)
+			}
+			m.selecting = false
+			m.renderPreviewHighlights()
+			// macOS terminals commonly reserve Command+C for their own native
+			// selection and never forward it to a TUI. Commit Navigator's
+			// source-only selection to the system clipboard on release so the
+			// expected clipboard content is available in those terminals.
+			if runtime.GOOS == "darwin" {
+				if text := m.selectedText(); text != "" {
+					return m, tea.SetClipboard(text)
+				}
+			}
+			return m, nil
+		}
 	case tea.KeyPressMsg:
 		k := msg.String()
 		if m.finding {
@@ -778,7 +868,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.applyFind()
 			return m, nil
 		}
-		if k == "q" {
+		if isSystemCopyKey(msg) {
+			if text := m.selectedText(); text != "" {
+				return m, tea.SetClipboard(text)
+			}
+		}
+		if k == "q" || k == "ctrl+c" {
 			if m.watcher != nil {
 				m.watcher.close()
 			}
@@ -830,21 +925,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.nextFind(1)
 				return m, nil
 			}
-			if k == "y" || k == "ctrl+c" {
+			if k == "y" {
 				if text := m.selectedText(); text != "" {
 					return m, tea.SetClipboard(text)
 				}
 			}
 			if k == "shift+up" || k == "shift+down" {
-				if m.selectionStart < 0 {
-					m.selectionStart = m.viewport.YOffset()
-					m.selectionEnd = m.selectionStart
-				}
 				if k == "shift+up" {
-					m.selectionEnd = max(0, m.selectionEnd-1)
+					m.extendSelectionByLine(-1)
 				} else {
-					m.selectionEnd = min(len(m.previewLines)-1, m.selectionEnd+1)
+					m.extendSelectionByLine(1)
 				}
+				m.renderPreviewHighlights()
 				return m, nil
 			}
 			m.viewport, _ = m.viewport.Update(msg)
@@ -853,6 +945,109 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.moveTree(k)
 	}
 	return m, tea.Batch(cmds...)
+}
+
+func isSystemCopyKey(msg tea.KeyPressMsg) bool {
+	key := msg.Key()
+	mod := key.Mod &^ (tea.ModCapsLock | tea.ModNumLock | tea.ModScrollLock)
+	return key.Code == 'c' && (mod == tea.ModCtrl || mod == tea.ModSuper)
+}
+
+// previewLineAt maps a terminal row to a visible preview line. The title is
+// row 0, tree rows are 1..treeHeight, and the preview label takes the next
+// row, so preview content begins at treeHeight+2.
+func (m model) previewLineAt(y int) (int, bool) {
+	const headerRows = 2 // explorer title and preview title
+	firstPreviewRow := m.treeHeight + headerRows
+	line := m.viewport.YOffset() + y - firstPreviewRow
+	if y < firstPreviewRow || line < 0 || line >= len(m.previewLines) {
+		return 0, false
+	}
+	return line, true
+}
+
+// previewLineAtOrEdge lets a drag continue to either vertical edge of the
+// preview instead of dropping the selection at its title or footer.
+func (m model) previewLineAtOrEdge(y int) int {
+	if line, ok := m.previewLineAt(y); ok {
+		return line
+	}
+	if y < m.treeHeight+2 {
+		return m.viewport.YOffset()
+	}
+	visibleLines := max(1, m.height-m.treeHeight-4)
+	return min(len(m.previewLines)-1, m.viewport.YOffset()+visibleLines-1)
+}
+
+func (m model) previewOffsetAt(x, y int) (int, bool) {
+	line, ok := m.previewLineAt(y)
+	if !ok {
+		return 0, false
+	}
+	before, _ := m.previewOffsetsAtCell(line, x)
+	return before, true
+}
+
+func (m model) previewOffsetAtOrEdge(x, y int, includeForwardCharacter bool) int {
+	line := m.previewLineAtOrEdge(y)
+	before, after := m.previewOffsetsAtCell(line, x)
+	if includeForwardCharacter && before >= m.selectionStart {
+		return after
+	}
+	return before
+}
+
+func (m model) previewOffsetsAtCell(line, x int) (int, int) {
+	if len(m.previewLines) == 0 || len(m.previewLineOffsets) != len(m.previewLines) {
+		return 0, 0
+	}
+	line = min(max(0, line), len(m.previewLines)-1)
+	// The gutter stays fixed while the content scrolls horizontally. A pointer
+	// in the gutter is treated as the visible left edge of the source.
+	column := m.viewport.XOffset()
+	if x >= previewGutterWidth {
+		column += x - previewGutterWidth
+	}
+	before, after := byteOffsetsAtDisplayCellFromColumn(m.previewLines[line], column, previewGutterWidth)
+	base := m.previewLineOffsets[line]
+	return base + before, base + after
+}
+
+// byteOffsetsAtDisplayCell returns the byte boundaries around the character in
+// a terminal cell. Wide and combining characters are kept indivisible; a tab
+// is treated as one selectable character spanning its terminal tab stop.
+func byteOffsetsAtDisplayCell(line string, target int) (int, int) {
+	return byteOffsetsAtDisplayCellFromColumn(line, target, 0)
+}
+
+func byteOffsetsAtDisplayCellFromColumn(line string, target, initialColumn int) (int, int) {
+	const tabWidth = 8
+	target = max(0, target)
+	initialColumn = max(0, initialColumn)
+	cells := 0
+	for i, r := range line {
+		size := utf8.RuneLen(r)
+		width := runewidth.RuneWidth(r)
+		if r == '\t' {
+			width = tabWidth - (initialColumn+cells)%tabWidth
+		}
+		if width > 0 && target < cells+width {
+			after := i + size
+			for after < len(line) {
+				next, nextSize := utf8.DecodeRuneInString(line[after:])
+				// Control characters such as tabs can report zero display
+				// width, but they are independent selectable characters rather
+				// than combining marks belonging to the preceding rune.
+				if next == '\t' || runewidth.RuneWidth(next) > 0 {
+					break
+				}
+				after += nextSize
+			}
+			return i, after
+		}
+		cells += max(0, width)
+	}
+	return len(line), len(line)
 }
 
 func (m *model) toggleDirectory(n *Node) tea.Cmd {
@@ -930,19 +1125,42 @@ func (m *model) moveTree(k string) tea.Cmd {
 }
 
 func (m model) selectedText() string {
-	if m.selectionStart < 0 || m.selectionEnd < 0 {
+	a, b, ok := orderedSelectionRange(m.preview, m.selectionStart, m.selectionEnd)
+	if !ok {
 		return ""
 	}
-	a, b := m.selectionStart, m.selectionEnd
-	if a > b {
-		a, b = b, a
+	return m.preview[a:b]
+}
+
+func (m *model) extendSelectionByLine(delta int) {
+	if len(m.previewLines) == 0 || len(m.previewLineOffsets) != len(m.previewLines) {
+		return
 	}
-	a = max(0, a)
-	b = min(len(m.previewLines)-1, b)
-	if a > b {
-		return ""
+	if m.selectionStart < 0 {
+		line := min(max(0, m.viewport.YOffset()), len(m.previewLines)-1)
+		if delta < 0 {
+			m.selectionStart = m.previewLineOffsets[line] + len(m.previewLines[line])
+		} else {
+			m.selectionStart = m.previewLineOffsets[line]
+		}
+		m.selectionEnd = m.selectionStart
 	}
-	return strings.Join(m.previewLines[a:b+1], "\n")
+	line := m.previewLineForOffset(m.selectionEnd)
+	line = min(max(0, line+delta), len(m.previewLines)-1)
+	if delta < 0 {
+		m.selectionEnd = m.previewLineOffsets[line]
+	} else {
+		m.selectionEnd = m.previewLineOffsets[line] + len(m.previewLines[line])
+	}
+}
+
+func (m model) previewLineForOffset(offset int) int {
+	for i := len(m.previewLineOffsets) - 1; i > 0; i-- {
+		if offset >= m.previewLineOffsets[i] {
+			return i
+		}
+	}
+	return 0
 }
 
 func depth(n *Node) int {
