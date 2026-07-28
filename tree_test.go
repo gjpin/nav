@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -136,7 +137,7 @@ func TestEmptyExplorerNavigationIsSafe(t *testing.T) {
 	}
 }
 
-func TestNewModelSelectsFirstVisibleEntry(t *testing.T) {
+func TestNewModelDoesNotReadTreeBeforeInit(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "z.txt"), "z")
 	writeFile(t, filepath.Join(root, "adir", "file.txt"), "x")
@@ -147,11 +148,34 @@ func TestNewModelSelectsFirstVisibleEntry(t *testing.T) {
 	if m.watcher != nil {
 		defer m.watcher.close()
 	}
-	nodes := visibleNodes(m.tree)
-	if len(nodes) == 0 {
-		t.Fatal("expected a visible entry")
+	if got := m.visible(); len(got) != 0 {
+		t.Fatalf("visible rows = %d, want no synchronous scan", len(got))
 	}
-	if m.selected != nodes[0].Path {
-		t.Fatalf("selected = %q, want first visible entry %q", m.selected, nodes[0].Path)
+	if m.selected != root {
+		t.Fatalf("selected = %q, want root %q", m.selected, root)
+	}
+	if m.tree.LoadState != LoadUnloaded {
+		t.Fatalf("root load state = %v, want unloaded", m.tree.LoadState)
+	}
+	if m.watcher != nil && len(m.watcher.watched) != 1 {
+		t.Fatalf("watch count = %d, want root only", len(m.watcher.watched))
+	}
+}
+
+func TestDirectoryLoaderStreamsDirectEntries(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < directoryBatchSize+10; i++ {
+		writeFile(t, filepath.Join(root, fmt.Sprintf("file-%03d", i)), "x")
+	}
+	loader := newDirectoryLoader(root)
+	defer loader.close()
+	first := <-loader.changes
+	if len(first.entries) != directoryBatchSize || first.done {
+		t.Fatalf("first batch = %d entries, done=%t", len(first.entries), first.done)
+	}
+	for _, entry := range first.entries {
+		if entry.IsDir() {
+			t.Fatalf("unexpected recursive entry: %s", entry.Name())
+		}
 	}
 }

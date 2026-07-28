@@ -55,6 +55,36 @@ func TestInspectGitStatusesAndDeletedGhost(t *testing.T) {
 	}
 }
 
+func TestInspectGitTrackedSkipsUntrackedFiles(t *testing.T) {
+	root := t.TempDir()
+	git(t, root, "init", "-q")
+	git(t, root, "config", "user.email", "test@example.com")
+	git(t, root, "config", "user.name", "Test")
+	writeFile(t, filepath.Join(root, "tracked.txt"), "old\n")
+	git(t, root, "add", ".")
+	git(t, root, "commit", "-qm", "initial")
+	writeFile(t, filepath.Join(root, "tracked.txt"), "new\n")
+	writeFile(t, filepath.Join(root, "untracked.txt"), "new\n")
+	info := inspectGitTracked(root)
+	if info.Statuses["tracked.txt"] != StatusChanged {
+		t.Fatalf("tracked status = %v", info.Statuses["tracked.txt"])
+	}
+	if _, ok := info.Statuses["untracked.txt"]; ok {
+		t.Fatalf("untracked file was included in tracked-only status: %v", info.Statuses)
+	}
+}
+
+func TestInspectGitDirectoryFindsUntrackedDirectoryWithoutFullStatus(t *testing.T) {
+	root := t.TempDir()
+	git(t, root, "init", "-q")
+	writeFile(t, filepath.Join(root, "untracked", "child.txt"), "new\n")
+	info := inspectGitTracked(root)
+	statuses := inspectGitDirectory(info, "")
+	if statuses["untracked"] != StatusAdded {
+		t.Fatalf("untracked directory status = %v, statuses=%v", statuses["untracked"], statuses)
+	}
+}
+
 func TestDiffMarksHandlesAddedAndDeletedOnlyHunks(t *testing.T) {
 	diff := strings.Join([]string{"diff --git a/a b/a", "@@ -1,2 +1,2 @@", "-old", "+new", " keep", "@@ -9 +9,0 @@", "-last"}, "\n")
 	adds, dels := diffMarks(diff, 2)

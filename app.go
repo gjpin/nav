@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -48,20 +47,36 @@ func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{k.ShortHelp(), {k.Copy, k.Next, k.Previous}}
 }
 
-type snapshot struct {
-	tree *Node
-	git  gitInfo
+type directoryMsg struct {
+	path       string
+	generation int
+	batch      directoryBatch
 }
-type scanMsg struct {
-	serial int
-	data   snapshot
-	err    error
+type gitMsg struct {
+	generation int
+	info       gitInfo
 }
-type watchMsg struct{}
+type directoryGitMsg struct {
+	path       string
+	generation int
+	statuses   map[string]FileStatus
+}
+type previewMsg struct {
+	generation   int
+	path         string
+	diffMode     bool
+	openToChange bool
+	text         string
+	rendered     string
+	added        map[int]bool
+	changed      map[int]bool
+	removed      map[int]int
+}
+type watchMsg struct{ path string }
 
 type fileWatcher struct {
 	w       *fsnotify.Watcher
-	changes chan struct{}
+	changes chan string
 	done    chan struct{}
 	once    sync.Once
 	mu      sync.Mutex
@@ -73,43 +88,38 @@ func newFileWatcher(root string) *fileWatcher {
 	if err != nil {
 		return nil
 	}
-	fw := &fileWatcher{w: w, changes: make(chan struct{}, 1), done: make(chan struct{}), watched: make(map[string]bool)}
+	fw := &fileWatcher{w: w, changes: make(chan string, 1), done: make(chan struct{}), watched: make(map[string]bool)}
 	fw.watch(root)
 	go fw.loop()
 	return fw
 }
 
-// watch adds newly discovered directories after a scan. Existing watches are
-// retained; fsnotify will report changes from ignored paths as well.
+// watch adds one visible directory. Recursive watches make opening a large
+// repository expensive and can exhaust the operating system watch limit.
 func (f *fileWatcher) watch(root string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var add func(string)
-	add = func(dir string) {
-		if f.watched[dir] {
-			return
-		}
-		if err := f.w.Add(dir); err != nil {
-			return
-		}
-		f.watched[dir] = true
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			return
-		}
-		for _, e := range entries {
-			if e.Name() == ".git" || !e.IsDir() || e.Type()&os.ModeSymlink != 0 {
-				continue
-			}
-			add(filepath.Join(dir, e.Name()))
+	if f.watched[root] || f.w.Add(root) != nil {
+		return
+	}
+	f.watched[root] = true
+}
+
+func (f *fileWatcher) unwatchBelow(root string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for path := range f.watched {
+		if path != root && strings.HasPrefix(path, root+string(filepath.Separator)) {
+			_ = f.w.Remove(path)
+			delete(f.watched, path)
 		}
 	}
-	add(root)
 }
 
 func (f *fileWatcher) loop() {
 	var timer *time.Timer
 	var timerC <-chan time.Time
+	var changed string
 	for {
 		select {
 		case <-f.done:
@@ -118,10 +128,11 @@ func (f *fileWatcher) loop() {
 			}
 			_ = f.w.Close()
 			return
-		case _, ok := <-f.w.Events:
+		case event, ok := <-f.w.Events:
 			if !ok {
 				return
 			}
+			changed = event.Name
 			if timer == nil {
 				timer = time.NewTimer(140 * time.Millisecond)
 			} else {
@@ -136,7 +147,7 @@ func (f *fileWatcher) loop() {
 			timerC = timer.C
 		case <-timerC:
 			select {
-			case f.changes <- struct{}{}:
+			case f.changes <- changed:
 			default:
 			}
 			timerC = nil
@@ -144,41 +155,40 @@ func (f *fileWatcher) loop() {
 		}
 	}
 }
-func (f *fileWatcher) next() tea.Cmd { return func() tea.Msg { <-f.changes; return watchMsg{} } }
-func (f *fileWatcher) close()        { f.once.Do(func() { close(f.done) }) }
+func (f *fileWatcher) next() tea.Cmd {
+	return func() tea.Msg { return watchMsg{path: <-f.changes} }
+}
+func (f *fileWatcher) close() { f.once.Do(func() { close(f.done) }) }
 
 type model struct {
-	root                            string
-	tree                            *Node
-	git                             gitInfo
-	selected                        string
-	treeOffset                      int
-	width, height, treeHeight       int
-	focusPreview, diffMode, finding bool
-	preview                         string
-	renderedPreview                 string
-	previewLines                    []string
-	added                           map[int]bool
-	changed                         map[int]bool
-	removed                         map[int]int
-	selectionStart, selectionEnd    int
-	selecting                       bool
-	viewport                        viewport.Model
-	find                            textinput.Model
-	help                            help.Model
-	keys                            keyMap
-	watcher                         *fileWatcher
-	serial                          int
-}
-
-func scan(root string, expanded map[string]bool) (snapshot, error) {
-	git := inspectGit(root)
-	tree, err := BuildTree(root, git.Statuses, expanded)
-	return snapshot{tree: tree, git: git}, err
+	root                             string
+	tree                             *Node
+	git                              gitInfo
+	selected                         string
+	treeOffset                       int
+	width, height, treeHeight        int
+	focusPreview, diffMode, finding  bool
+	preview                          string
+	renderedPreview                  string
+	previewLines                     []string
+	added                            map[int]bool
+	changed                          map[int]bool
+	removed                          map[int]int
+	selectionStart, selectionEnd     int
+	selecting                        bool
+	viewport                         viewport.Model
+	find                             textinput.Model
+	help                             help.Model
+	keys                             keyMap
+	watcher                          *fileWatcher
+	loaders                          map[string]*directoryLoader
+	loadGeneration                   map[string]int
+	gitGeneration, previewGeneration int
+	rows                             []*Node
 }
 
 func newModel(root string) (model, error) {
-	data, err := scan(root, map[string]bool{})
+	tree, err := lazyRoot(root)
 	if err != nil {
 		return model{}, err
 	}
@@ -189,20 +199,188 @@ func newModel(root string) (model, error) {
 	f := textinput.New()
 	f.Prompt = "Find: "
 	f.Placeholder = "text"
-	selected := root
-	if nodes := visibleNodes(data.tree); len(nodes) > 0 {
-		selected = nodes[0].Path
-	}
-	m := model{root: root, tree: data.tree, git: data.git, selected: selected, viewport: v, find: f, help: help.New(), keys: newKeyMap(), watcher: newFileWatcher(root), selectionStart: -1, selectionEnd: -1}
-	m.loadPreview(false)
+	m := model{root: root, tree: tree, git: gitInfo{Root: root, Statuses: make(map[string]FileStatus)}, selected: root, viewport: v, find: f, help: help.New(), keys: newKeyMap(), watcher: newFileWatcher(root), loaders: make(map[string]*directoryLoader), loadGeneration: make(map[string]int), selectionStart: -1, selectionEnd: -1}
+	m.rebuildRows()
 	return m, nil
 }
 
+func hasExpandedChild(n *Node) bool {
+	for _, child := range n.Children {
+		if child.Dir && child.Expanded {
+			return true
+		}
+	}
+	return false
+}
+
 func (m model) Init() tea.Cmd {
-	if m.watcher == nil {
+	cmds := []tea.Cmd{m.startDirectoryLoad(m.tree), gitCmd(m.root, m.gitGeneration)}
+	if m.watcher != nil {
+		cmds = append(cmds, m.watcher.next())
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m *model) rebuildRows() { m.rows = visibleNodes(m.tree) }
+
+func (m *model) visible() []*Node { return m.rows }
+
+func (m *model) startDirectoryLoad(node *Node) tea.Cmd {
+	if node == nil || !node.Dir || node.Ghost {
 		return nil
 	}
-	return m.watcher.next()
+	if old := m.loaders[node.Path]; old != nil {
+		old.close()
+	}
+	m.loadGeneration[node.Path]++
+	generation := m.loadGeneration[node.Path]
+	kept := node.Children[:0]
+	for _, child := range node.Children {
+		if hasGhost(child) {
+			kept = append(kept, child)
+		}
+	}
+	node.Children = kept
+	node.LoadError = ""
+	node.LoadState = LoadLoading
+	loader := newDirectoryLoader(node.Path)
+	m.loaders[node.Path] = loader
+	return func() tea.Msg {
+		batch, ok := <-loader.changes
+		if !ok {
+			return directoryMsg{path: node.Path, generation: generation, batch: directoryBatch{done: true}}
+		}
+		return directoryMsg{path: node.Path, generation: generation, batch: batch}
+	}
+}
+
+func hasGhost(n *Node) bool {
+	if n.Ghost {
+		return true
+	}
+	for _, child := range n.Children {
+		if hasGhost(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *model) nextDirectoryLoad(path string, generation int) tea.Cmd {
+	loader := m.loaders[path]
+	if loader == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		batch, ok := <-loader.changes
+		if !ok {
+			return directoryMsg{path: path, generation: generation, batch: directoryBatch{done: true}}
+		}
+		return directoryMsg{path: path, generation: generation, batch: batch}
+	}
+}
+
+func (m *model) loadDirectoryResult(msg directoryMsg) tea.Cmd {
+	if msg.generation != m.loadGeneration[msg.path] {
+		return nil
+	}
+	node := findNode(m.tree, msg.path)
+	if node == nil || !node.Dir {
+		return nil
+	}
+	appendEntries(node, msg.batch.entries, m.git.Statuses)
+	if msg.batch.err != nil && !msg.batch.done {
+		node.LoadError = msg.batch.err.Error()
+	}
+	if msg.batch.done {
+		delete(m.loaders, msg.path)
+		if msg.batch.err != nil && msg.batch.err.Error() != "EOF" {
+			node.LoadState, node.LoadError = LoadFailed, msg.batch.err.Error()
+		} else {
+			node.LoadState = LoadLoaded
+			node.sort()
+		}
+	} else {
+		node.LoadState = LoadPartial
+	}
+	if node == m.tree && !hasExpandedChild(node) {
+		// During the initial flat-directory stream the rows are exactly the
+		// root's direct children. Reuse that slice so each batch does not
+		// repeatedly traverse every entry received so far.
+		m.rows = node.Children
+	} else {
+		m.rebuildRows()
+	}
+	if m.selected == m.root && len(m.rows) > 0 {
+		m.selected = m.rows[0].Path
+	}
+	if node.Expanded && m.watcher != nil {
+		m.watcher.watch(node.Path)
+	}
+	if msg.batch.done {
+		if m.git.RepoRoot != "" {
+			return directoryGitCmd(m.git, node, msg.generation)
+		}
+		return nil
+	}
+	return m.nextDirectoryLoad(msg.path, msg.generation)
+}
+
+func (m *model) applyGit(info gitInfo) {
+	m.git = info
+	for _, n := range visibleNodes(m.tree) {
+		if status, ok := info.Statuses[n.Rel]; ok {
+			n.Status = status
+		}
+	}
+	m.addDeletedGhosts()
+	m.rebuildRows()
+}
+
+func (m *model) addDeletedGhosts() {
+	for rel, status := range m.git.Statuses {
+		if status != StatusDeleted || rel == "" || strings.HasPrefix(rel, "../") {
+			continue
+		}
+		parent := m.tree
+		parts := strings.Split(filepath.ToSlash(filepath.Clean(rel)), "/")
+		for i, part := range parts {
+			path := filepath.Join(m.root, filepath.FromSlash(strings.Join(parts[:i+1], "/")))
+			n := findNode(m.tree, path)
+			if n == nil {
+				n = &Node{Name: part, Path: path, Rel: filepath.ToSlash(strings.Join(parts[:i+1], "/")), Dir: i != len(parts)-1, Ghost: i == len(parts)-1, LoadState: LoadUnloaded}
+				if n.Ghost {
+					n.Status = StatusDeleted
+				}
+				parent.add(n)
+			}
+			parent = n
+		}
+	}
+}
+
+func gitCmd(root string, generation int) tea.Cmd {
+	return func() tea.Msg { return gitMsg{generation: generation, info: inspectGitTracked(root)} }
+}
+
+func directoryGitCmd(info gitInfo, node *Node, generation int) tea.Cmd {
+	path, rel := node.Path, node.Rel
+	return func() tea.Msg {
+		return directoryGitMsg{path: path, generation: generation, statuses: inspectGitDirectory(info, rel)}
+	}
+}
+
+func (m *model) applyDirectoryGit(msg directoryGitMsg) {
+	if msg.generation != m.loadGeneration[msg.path] {
+		return
+	}
+	for rel, status := range msg.statuses {
+		m.git.Statuses[rel] = status
+		if node := findNode(m.tree, filepath.Join(m.root, filepath.FromSlash(rel))); node != nil {
+			node.Status = status
+		}
+	}
+	m.rebuildRows()
 }
 
 func (m model) expanded() map[string]bool {
@@ -228,7 +406,7 @@ func (m *model) selectedNode() *Node {
 	if m.tree == nil {
 		return nil
 	}
-	for _, n := range visibleNodes(m.tree) {
+	for _, n := range m.visible() {
 		if n.Path == m.selected {
 			return n
 		}
@@ -236,40 +414,58 @@ func (m *model) selectedNode() *Node {
 	return m.tree
 }
 
-// loadPreview refreshes the current file. openToChange is reserved for an
-// explicit file open; routine tree movement and filesystem refreshes retain
-// the preview's current scroll position.
-func (m *model) loadPreview(openToChange bool) {
+func previewCmd(info gitInfo, node Node, diffMode bool, openToChange bool, generation int) tea.Cmd {
+	return func() tea.Msg {
+		var text string
+		if diffMode {
+			text, _ = gitDiff(info, &node)
+		} else {
+			text, _ = readPreview(&node)
+		}
+		if diffMode && text == "" {
+			text = "No diff against HEAD."
+		}
+		lines := strings.Split(text, "\n")
+		var added, changed map[int]bool
+		var removed map[int]int
+		if !diffMode {
+			diff, _ := gitDiff(info, &node)
+			added, changed, removed = diffLineMarks(diff, len(lines))
+			if removed[len(lines)] > 0 {
+				lines = append(lines, "")
+				text = strings.Join(lines, "\n")
+			}
+		}
+		rendered := text
+		if !diffMode {
+			rendered = renderPreview(node.Path, text)
+		}
+		return previewMsg{generation: generation, path: node.Path, diffMode: diffMode, openToChange: openToChange, text: text, rendered: rendered, added: added, changed: changed, removed: removed}
+	}
+}
+
+func (m *model) requestPreview(openToChange bool) tea.Cmd {
 	n := m.selectedNode()
-	if n == nil {
+	if n == nil || n.Dir {
+		return nil
+	}
+	m.previewGeneration++
+	m.preview = "Loading preview…"
+	m.renderedPreview = m.preview
+	m.previewLines = []string{m.preview}
+	m.viewport.SetContent(m.preview)
+	return previewCmd(m.git, *n, m.diffMode, openToChange, m.previewGeneration)
+}
+
+// applyPreview accepts a completed background preview for the current file.
+func (m *model) applyPreview(msg previewMsg, openToChange bool) {
+	if msg.generation != m.previewGeneration || msg.path != m.selected || msg.diffMode != m.diffMode {
 		return
 	}
-	var text string
-	if m.diffMode {
-		text, _ = gitDiff(m.git, n)
-	} else {
-		text, _ = readPreview(n)
-	}
-	if m.diffMode && text == "" {
-		text = "No diff against HEAD."
-	}
-	m.preview = text
-	m.previewLines = strings.Split(text, "\n")
-	m.added, m.changed, m.removed = nil, nil, nil
-	if !m.diffMode {
-		diff, _ := gitDiff(m.git, n)
-		m.added, m.changed, m.removed = diffLineMarks(diff, len(m.previewLines))
-		// Give a deleted-only range at EOF a concrete line on which to render
-		// its red removal-count gutter.
-		if m.removed[len(m.previewLines)] > 0 {
-			m.previewLines = append(m.previewLines, "")
-			m.preview = strings.Join(m.previewLines, "\n")
-		}
-	}
-	m.renderedPreview = m.preview
-	if !m.diffMode {
-		m.renderedPreview = renderPreview(n.Path, m.preview)
-	}
+	m.preview = msg.text
+	m.previewLines = strings.Split(msg.text, "\n")
+	m.added, m.changed, m.removed = msg.added, msg.changed, msg.removed
+	m.renderedPreview = msg.rendered
 	m.viewport.SetContent(m.renderedPreview)
 	// Only an explicit file open jumps to its first current-file change. This
 	// avoids resetting a touchpad scroll when the tree or watcher refreshes.
@@ -340,13 +536,6 @@ func (m *model) applyFind() {
 	m.viewport.SetHighlights(ranges)
 }
 
-func scanCmd(root string, serial int, expanded map[string]bool) tea.Cmd {
-	return func() tea.Msg {
-		data, err := scan(root, expanded)
-		return scanMsg{serial: serial, data: data, err: err}
-	}
-}
-
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 	switch msg := msg.(type) {
@@ -357,33 +546,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetHeight(max(1, msg.Height-m.treeHeight-4))
 		m.find.SetWidth(max(12, msg.Width-8))
 		return m, nil
-	case scanMsg:
-		if msg.serial != m.serial || msg.err != nil {
-			return m, nil
-		}
-		m.tree, m.git = msg.data.tree, msg.data.git
-		if m.watcher != nil {
-			m.watcher.watch(m.root)
-		}
-		valid := false
-		for _, node := range visibleNodes(m.tree) {
-			if node.Path == m.selected {
-				valid = true
-				break
+	case directoryMsg:
+		return m, m.loadDirectoryResult(msg)
+	case gitMsg:
+		if msg.generation == m.gitGeneration {
+			m.applyGit(msg.info)
+			if m.tree.LoadState == LoadLoaded {
+				return m, directoryGitCmd(m.git, m.tree, m.loadGeneration[m.tree.Path])
 			}
 		}
-		if !valid {
-			nodes := visibleNodes(m.tree)
-			m.selected = m.root
-			if len(nodes) > 0 {
-				m.selected = nodes[0].Path
-			}
-		}
-		m.loadPreview(false)
+		return m, nil
+	case directoryGitMsg:
+		m.applyDirectoryGit(msg)
+		return m, nil
+	case previewMsg:
+		m.applyPreview(msg, msg.openToChange)
 		return m, nil
 	case watchMsg:
-		m.serial++
-		cmds = append(cmds, scanCmd(m.root, m.serial, m.expanded()))
+		node := findNode(m.tree, filepath.Dir(msg.path))
+		if node == nil || !node.Dir {
+			node = m.tree
+		}
+		cmds = append(cmds, m.startDirectoryLoad(node))
+		m.gitGeneration++
+		cmds = append(cmds, gitCmd(m.root, m.gitGeneration))
 		if m.watcher != nil {
 			cmds = append(cmds, m.watcher.next())
 		}
@@ -403,7 +589,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if mouse.Button == tea.MouseWheelUp {
 				m.treeOffset = max(0, m.treeOffset-3)
 			} else {
-				m.treeOffset = min(max(0, len(visibleNodes(m.tree))-m.treeHeight), m.treeOffset+3)
+				m.treeOffset = min(max(0, len(m.visible())-m.treeHeight), m.treeOffset+3)
 			}
 			return m, nil
 		}
@@ -412,19 +598,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseClickMsg:
 		mouse := msg.Mouse()
 		if mouse.Y > 0 && mouse.Y <= m.treeHeight {
-			nodes := visibleNodes(m.tree)
+			nodes := m.visible()
 			idx := m.treeOffset + mouse.Y - 1
 			if idx >= 0 && idx < len(nodes) {
 				node := nodes[idx]
 				m.selected = node.Path
 				if node.Dir {
-					node.Expanded = !node.Expanded
+					cmds = append(cmds, m.toggleDirectory(node))
 				} else {
 					m.focusPreview = true
+					cmds = append(cmds, m.requestPreview(true))
 				}
-				m.loadPreview(!node.Dir)
 			}
-			return m, nil
+			return m, tea.Batch(cmds...)
 		}
 		if mouse.Y > m.treeHeight && mouse.Button == tea.MouseLeft && m.focusPreview {
 			m.selectionStart, m.selectionEnd, m.selecting = m.viewport.YOffset()+mouse.Y-m.treeHeight-1, m.viewport.YOffset()+mouse.Y-m.treeHeight-1, true
@@ -464,14 +650,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.find.Focus()
 		}
 		if k == "r" {
-			m.serial++
-			return m, scanCmd(m.root, m.serial, m.expanded())
+			cmds = append(cmds, m.startDirectoryLoad(m.tree))
+			m.gitGeneration++
+			cmds = append(cmds, gitCmd(m.root, m.gitGeneration))
+			return m, tea.Batch(cmds...)
 		}
 		if k == "d" {
 			n := m.selectedNode()
 			if n != nil && !n.Dir {
 				m.diffMode = !m.diffMode
-				m.loadPreview(false)
+				return m, m.requestPreview(false)
 			}
 			return m, nil
 		}
@@ -504,17 +692,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport, _ = m.viewport.Update(msg)
 			return m, nil
 		}
-		m.moveTree(k)
+		return m, m.moveTree(k)
 	}
 	return m, tea.Batch(cmds...)
 }
 
-func (m *model) moveTree(k string) {
-	nodes := visibleNodes(m.tree)
+func (m *model) toggleDirectory(n *Node) tea.Cmd {
+	if !n.Dir {
+		return nil
+	}
+	n.Expanded = !n.Expanded
+	if !n.Expanded {
+		for path, loader := range m.loaders {
+			if path == n.Path || strings.HasPrefix(path, n.Path+string(filepath.Separator)) {
+				loader.close()
+				delete(m.loaders, path)
+				m.loadGeneration[path]++
+			}
+		}
+		if m.watcher != nil {
+			m.watcher.unwatchBelow(n.Path)
+		}
+		m.rebuildRows()
+		return nil
+	}
+	m.rebuildRows()
+	if n.LoadState == LoadUnloaded || n.LoadState == LoadFailed {
+		return m.startDirectoryLoad(n)
+	}
+	if m.watcher != nil {
+		m.watcher.watch(n.Path)
+	}
+	return nil
+}
+
+func (m *model) moveTree(k string) tea.Cmd {
+	nodes := m.visible()
 	if len(nodes) == 0 {
 		m.selected = m.root
-		m.loadPreview(false)
-		return
+		return nil
 	}
 	idx := 0
 	for i, n := range nodes {
@@ -531,17 +747,19 @@ func (m *model) moveTree(k string) {
 		idx = min(len(nodes)-1, idx+1)
 	case "right":
 		if n := nodes[idx]; n.Dir {
-			n.Expanded = true
+			if !n.Expanded {
+				return m.toggleDirectory(n)
+			}
 		}
 	case "left":
 		if n := nodes[idx]; n.Dir && n.Expanded {
-			n.Expanded = false
+			return m.toggleDirectory(n)
 		} else if n.Parent != nil {
 			m.selected = n.Parent.Path
 		}
 	case "enter":
 		if n := nodes[idx]; n.Dir {
-			n.Expanded = !n.Expanded
+			return m.toggleDirectory(n)
 		} else {
 			m.focusPreview = true
 			openToChange = true
@@ -550,7 +768,7 @@ func (m *model) moveTree(k string) {
 	if len(nodes) > 0 && (k == "up" || k == "k" || k == "down" || k == "j") {
 		m.selected = nodes[idx].Path
 	}
-	m.loadPreview(openToChange)
+	return m.requestPreview(openToChange)
 }
 
 func (m model) selectedText() string {
@@ -581,7 +799,7 @@ func (m model) View() tea.View {
 	if m.tree == nil {
 		return tea.NewView("Loading…")
 	}
-	nodes := visibleNodes(m.tree)
+	nodes := m.visible()
 	if len(nodes) > m.treeHeight {
 		m.treeOffset = min(m.treeOffset, max(0, len(nodes)-m.treeHeight))
 	}
@@ -597,6 +815,9 @@ func (m model) View() tea.View {
 			}
 		}
 		name := strings.Repeat("  ", max(0, depth(n)-1)) + icon + n.Name
+		if n.Dir && (n.LoadState == LoadLoading || n.LoadState == LoadPartial) {
+			name += " …"
+		}
 		if n.Symlink {
 			name += " @"
 		}
@@ -620,6 +841,9 @@ func (m model) View() tea.View {
 		lines = append(lines, "")
 	}
 	title := cyanStyle.Render("navigator ") + mutedStyle.Render(m.root)
+	if m.tree.LoadState == LoadLoading || m.tree.LoadState == LoadPartial {
+		title += " " + mutedStyle.Render("loading…")
+	}
 	if m.git.RepoRoot != "" {
 		title += " " + mutedStyle.Render("git")
 	}

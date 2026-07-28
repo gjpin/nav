@@ -22,6 +22,16 @@ func runGit(dir string, args ...string) ([]byte, error) {
 }
 
 func inspectGit(root string) gitInfo {
+	return inspectGitWithUntracked(root, "all")
+}
+
+// inspectGitTracked avoids walking untracked directories. It is safe to run
+// after the UI has appeared and supplies tracked changes/deleted ghosts first.
+func inspectGitTracked(root string) gitInfo {
+	return inspectGitWithUntracked(root, "no")
+}
+
+func inspectGitWithUntracked(root, mode string) gitInfo {
 	info := gitInfo{Root: root, Statuses: make(map[string]FileStatus)}
 	top, err := runGit(root, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -37,10 +47,43 @@ func inspectGit(root string) gitInfo {
 	if physical, err := filepath.EvalSymlinks(info.RepoRoot); err == nil {
 		compareRepo = physical
 	}
-	out, err := runGit(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	out, err := runGit(root, "status", "--porcelain=v1", "-z", "--untracked-files="+mode)
 	if err != nil {
 		return info
 	}
+	info.Statuses = parseGitStatuses(compareRoot, compareRepo, out)
+	return info
+}
+
+// inspectGitDirectory resolves untracked entries only for one opened branch.
+// --untracked-files=normal reports direct files and opaque untracked folders,
+// avoiding a full walk of the branch's descendants.
+func inspectGitDirectory(info gitInfo, rel string) map[string]FileStatus {
+	if info.RepoRoot == "" {
+		return nil
+	}
+	args := []string{"status", "--porcelain=v1", "-z", "--untracked-files=normal", "--"}
+	if rel == "" {
+		args = append(args, ".")
+	} else {
+		args = append(args, filepath.FromSlash(rel))
+	}
+	out, err := runGit(info.Root, args...)
+	if err != nil {
+		return nil
+	}
+	compareRoot, compareRepo := info.Root, info.RepoRoot
+	if physical, err := filepath.EvalSymlinks(info.Root); err == nil {
+		compareRoot = physical
+	}
+	if physical, err := filepath.EvalSymlinks(info.RepoRoot); err == nil {
+		compareRepo = physical
+	}
+	return parseGitStatuses(compareRoot, compareRepo, out)
+}
+
+func parseGitStatuses(compareRoot, compareRepo string, out []byte) map[string]FileStatus {
+	statuses := make(map[string]FileStatus)
 	parts := bytes.Split(out, []byte{0})
 	for i := 0; i < len(parts); i++ {
 		entry := string(parts[i])
@@ -58,9 +101,9 @@ func inspectGit(root string) gitInfo {
 			continue
 		}
 		rel = filepath.ToSlash(rel)
-		info.Statuses[rel] = porcelainStatus(x, y)
+		statuses[rel] = porcelainStatus(x, y)
 	}
-	return info
+	return statuses
 }
 
 func porcelainStatus(x, y byte) FileStatus {

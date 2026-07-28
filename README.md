@@ -4,6 +4,12 @@
 narrow terminals. It includes ignored files, omits `.git`, and never follows
 directory symlinks.
 
+Navigator opens large repositories without recursively indexing them first.
+It loads each directory only when expanded; very large flat directories appear
+in batches and are alphabetized when loading finishes. Git badges populate
+after the explorer opens, with untracked entries resolved as their directories
+are loaded.
+
 Run it with Go 1.26:
 
 ```sh
