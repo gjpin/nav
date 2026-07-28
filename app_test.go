@@ -261,12 +261,27 @@ func TestApplyGitKeepsAddedStatusUntilDirectoryProbeCompletes(t *testing.T) {
 	root := t.TempDir()
 	tree := &Node{Name: "root", Path: root, Dir: true, Expanded: true}
 	added := &Node{Name: ".github", Path: filepath.Join(root, ".github"), Rel: ".github", Dir: true, Status: StatusAdded}
+	child := &Node{Name: "test.yml", Path: filepath.Join(root, ".github", "test.yml"), Rel: ".github/test.yml", Status: StatusAdded}
 	tree.add(added)
-	m := model{root: root, tree: tree}
+	added.add(child)
+	m := model{root: root, tree: tree, git: gitInfo{Statuses: map[string]FileStatus{
+		".github":          StatusAdded,
+		".github/test.yml": StatusAdded,
+	}}}
 
 	m.applyGit(gitInfo{Root: root, Statuses: map[string]FileStatus{}})
 	if added.Status != StatusAdded {
 		t.Fatalf("added status = %v, want it preserved until the directory probe", added.Status)
+	}
+	if child.Status != StatusAdded {
+		t.Fatalf("added child status = %v, want it preserved until the directory probe", child.Status)
+	}
+
+	// A root probe still sees an untracked directory as one opaque entry. It
+	// must not erase leaf statuses already resolved by opening that directory.
+	m.applyDirectoryGit(directoryGitMsg{path: root, statuses: map[string]FileStatus{".github": StatusAdded}})
+	if child.Status != StatusAdded {
+		t.Fatalf("added child status after root probe = %v, want added", child.Status)
 	}
 }
 

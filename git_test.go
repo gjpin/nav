@@ -146,6 +146,30 @@ func TestInspectGitDirectoryFindsUntrackedDirectoryWithoutFullStatus(t *testing.
 	}
 }
 
+func TestInspectGitDirectoryExpandsFilesInsideOpenedUntrackedDirectory(t *testing.T) {
+	root := t.TempDir()
+	git(t, root, "init", "-q")
+	writeFile(t, filepath.Join(root, ".gitignore"), "new/ignored.txt\n")
+	git(t, root, "add", ".gitignore")
+	writeFile(t, filepath.Join(root, "new", "child.txt"), "new\n")
+	writeFile(t, filepath.Join(root, "new", "nested", "grandchild.txt"), "new\n")
+	writeFile(t, filepath.Join(root, "new", "ignored.txt"), "ignored\n")
+
+	info := inspectGitTracked(root)
+	statuses := inspectGitDirectory(info, "new")
+	for _, path := range []string{"new/child.txt", "new/nested/grandchild.txt"} {
+		if statuses[path] != StatusAdded {
+			t.Errorf("%s status = %v, want added; statuses=%v", path, statuses[path], statuses)
+		}
+	}
+	if _, ok := statuses["new/ignored.txt"]; ok {
+		t.Fatalf("ignored file was included: %v", statuses)
+	}
+	if treeStatuses := aggregateGitStatuses(statuses); treeStatuses["new/nested"] != StatusAdded {
+		t.Fatalf("nested directory status = %v, want added", treeStatuses["new/nested"])
+	}
+}
+
 func TestGitMetadataDir(t *testing.T) {
 	root := t.TempDir()
 	git(t, root, "init", "-q")

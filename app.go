@@ -379,9 +379,20 @@ func (m *model) loadDirectoryResult(msg directoryMsg) tea.Cmd {
 
 func (m *model) applyGit(info gitInfo) {
 	// The initial Git probe deliberately skips untracked files so opening a
-	// large repository stays cheap. Keep any added badges from the preceding
-	// directory probe until its replacement arrives; otherwise an untracked
-	// directory briefly changes from green to plain on every refresh.
+	// large repository stays cheap. Carry resolved additions forward until an
+	// authoritative probe of their parent directory replaces them; keeping
+	// only the node decoration is insufficient because a later directory
+	// result rebuilds every decoration from this status map.
+	if info.Statuses == nil {
+		info.Statuses = make(map[string]FileStatus)
+	}
+	for rel, status := range m.git.Statuses {
+		if status == StatusAdded {
+			if _, current := info.Statuses[rel]; !current {
+				info.Statuses[rel] = status
+			}
+		}
+	}
 	clearGitDecorations(m.tree, true)
 	info.TreeStatuses = aggregateGitStatuses(info.Statuses)
 	m.git = info
@@ -467,12 +478,17 @@ func (m *model) applyDirectoryGit(msg directoryGitMsg) {
 	// prior untracked badge only after the replacement probe has completed, so
 	// a tracked-only refresh cannot make it flicker in the meantime.
 	if msg.statuses != nil {
-		for _, child := range node.Children {
-			if child.Status == StatusAdded {
-				if _, ok := msg.statuses[child.Rel]; !ok {
-					child.Status = StatusNone
-					delete(m.git.Statuses, child.Rel)
-				}
+		replacementTree := aggregateGitStatuses(msg.statuses)
+		for rel, status := range m.git.Statuses {
+			if status != StatusAdded {
+				continue
+			}
+			parent := ""
+			if slash := strings.LastIndexByte(rel, '/'); slash >= 0 {
+				parent = rel[:slash]
+			}
+			if parent == node.Rel && replacementTree[rel] == StatusNone {
+				delete(m.git.Statuses, rel)
 			}
 		}
 	}

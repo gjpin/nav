@@ -117,20 +117,13 @@ func mergeFileStatus(current, next FileStatus) FileStatus {
 }
 
 // inspectGitDirectory resolves untracked entries only for one opened branch.
-// --untracked-files=normal reports direct files and opaque untracked folders,
-// avoiding a full walk of the branch's descendants.
+// The first probe reports direct files and opaque untracked folders without
+// walking their descendants. Once the opened branch is itself one of those
+// opaque folders, a second scoped probe expands it so its files receive badges
+// too. This keeps the root probe cheap while making an expanded untracked tree
+// accurate.
 func inspectGitDirectory(info gitInfo, rel string) map[string]FileStatus {
 	if info.RepoRoot == "" {
-		return nil
-	}
-	args := []string{"status", "--porcelain=v1", "-z", "--untracked-files=normal", "--"}
-	if rel == "" {
-		args = append(args, ".")
-	} else {
-		args = append(args, filepath.FromSlash(rel))
-	}
-	out, err := runGit(info.Root, args...)
-	if err != nil {
 		return nil
 	}
 	compareRoot, compareRepo := info.Root, info.RepoRoot
@@ -140,7 +133,25 @@ func inspectGitDirectory(info gitInfo, rel string) map[string]FileStatus {
 	if physical, err := filepath.EvalSymlinks(info.RepoRoot); err == nil {
 		compareRepo = physical
 	}
-	return parseGitStatuses(compareRoot, compareRepo, out)
+	inspect := func(mode string) map[string]FileStatus {
+		args := []string{"status", "--porcelain=v1", "-z", "--untracked-files=" + mode, "--"}
+		if rel == "" {
+			args = append(args, ".")
+		} else {
+			args = append(args, filepath.FromSlash(rel))
+		}
+		out, err := runGit(info.Root, args...)
+		if err != nil {
+			return nil
+		}
+		return parseGitStatuses(compareRoot, compareRepo, out)
+	}
+
+	statuses := inspect("normal")
+	if rel != "" && statuses[rel] == StatusAdded {
+		return inspect("all")
+	}
+	return statuses
 }
 
 func parseGitStatuses(compareRoot, compareRepo string, out []byte) map[string]FileStatus {
